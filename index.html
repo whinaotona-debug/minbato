@@ -7,6 +7,7 @@
 <title>みんばと！リズムパーティ</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;600;700&family=Mochiy+Pop+One&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/mqtt@5.10.4/dist/mqtt.min.js"></script>
 <style>
 :root {
   --bg1: #ff6b9d;
@@ -452,9 +453,10 @@ class RhythmEngine {
   }
 }
 
-/* ========== Net (Trystero P2P rooms) ========== */
+/* ========== Net (MQTT shared rooms — no WebRTC) ========== */
 const Net = {
-  room: null,
+  client: null,
+  topic: null,
   hostId: null, // room code
   isHost: false,
   solo: false,
@@ -464,113 +466,205 @@ const Net = {
   onPlayers: null,
   onMessage: null,
   onStatus: null,
-  _sendRaw: null,
-  _leave: null,
-  _selfId: null,
+  _heartbeat: null,
+  _seen: new Map(), // id -> lastSeen ms
 
   setStatus(text, ok = true) {
     if (this.onStatus) this.onStatus(text, ok);
   },
 
   me() {
-    return { id: this.myId, name: this.myName, score: this.players.get(this.myId)?.score || 0, isHost: this.isHost };
+    return {
+      id: this.myId,
+      name: this.myName,
+      score: this.players.get(this.myId)?.score || 0,
+      isHost: this.isHost
+    };
   },
 
   _emitPlayers() {
     if (this.onPlayers) this.onPlayers([...this.players.values()]);
   },
 
-  async _loadStrategy() {
-    const urls = [
-      'https://esm.sh/trystero@0.21.8/mqtt',
-      'https://esm.sh/trystero@0.21.8/torrent'
+  _brokers() {
+    return [
+      'wss://broker.emqx.io:8084/mqtt',
+      'wss://test.mosquitto.org:8081/mqtt',
+      'wss://broker.hivemq.com:8884/mqtt'
     ];
+  },
+
+  async _connectMqtt() {
+    if (typeof mqtt === 'undefined' || !mqtt.connect) {
+      throw new Error('通信ライブラリの読み込みに失敗しました。再読み込みしてね');
+    }
+    const brokers = this._brokers();
     let lastErr;
-    for (const url of urls) {
+    for (const url of brokers) {
       try {
-        const mod = await import(url);
-        if (!mod.joinRoom || !mod.selfId) throw new Error('invalid module');
-        return mod;
+        const client = await new Promise((resolve, reject) => {
+          const c = mqtt.connect(url, {
+            clientId: 'mb' + Math.random().toString(16).slice(2, 10),
+            clean: true,
+            connectTimeout: 8000,
+            reconnectPeriod: 3000,
+            protocolVersion: 4
+          });
+          const to = setTimeout(() => {
+            try { c.end(true); } catch {}
+            reject(new Error('timeout: ' + url));
+          }, 9000);
+          c.on('connect', () => { clearTimeout(to); resolve(c); });
+          c.on('error', (e) => { clearTimeout(to); try { c.end(true); } catch {}; reject(e); });
+        });
+        return client;
       } catch (e) {
         lastErr = e;
       }
     }
-    throw lastErr || new Error('通信ライブラリの読み込みに失敗しました');
+    throw lastErr || new Error('MQTTブローカーに接続できません');
+  },
+
+  _publish(msg) {
+    if (!this.client || !this.topic || !this.client.connected) return;
+    try {
+      this.client.publish(this.topic, JSON.stringify({ ...msg, from: this.myId, t: Date.now() }), { qos: 0 });
+    } catch {}
+  },
+
+  _announce(extra = {}) {
+    this._publish({
+      type: 'hello',
+      name: this.myName,
+      isHost: this.isHost,
+      score: this.players.get(this.myId)?.score || 0,
+      ...extra
+    });
+  },
+
+  _prunePlayers() {
+    const now = Date.now();
+    let changed = false;
+    for (const [id, ts] of this._seen) {
+      if (id === this.myId) continue;
+      if (now - ts > 12000) {
+        this._seen.delete(id);
+        this.players.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) {
+      this._emitPlayers();
+      this.setStatus(`オンライン（${this.players.size}人）`, true);
+    }
+  },
+
+  _onMessage(raw) {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (!msg || !msg.type) return;
+    const fromId = msg.from;
+    if (!fromId || fromId === this.myId) return;
+
+    this._seen.set(fromId, Date.now());
+
+    if (msg.type === 'hello' || msg.type === 'ping') {
+      this.players.set(fromId, {
+        id: fromId,
+        name: msg.name || this.players.get(fromId)?.name || 'プレイヤー',
+        score: typeof msg.score === 'number' ? msg.score : (this.players.get(fromId)?.score || 0),
+        isHost: !!msg.isHost
+      });
+      this._emitPlayers();
+      this.setStatus(`オンライン（${this.players.size}人）`, true);
+      return;
+    }
+
+    if (msg.type === 'score') {
+      const p = this.players.get(fromId) || { id: fromId, name: 'プレイヤー', isHost: false };
+      p.score = msg.score;
+      this.players.set(fromId, p);
+      this._emitPlayers();
+      return;
+    }
+
+    if (msg.type === 'bye') {
+      this.players.delete(fromId);
+      this._seen.delete(fromId);
+      this._emitPlayers();
+      this.setStatus(`オンライン（${this.players.size}人）`, true);
+      return;
+    }
+
+    if (msg.type === 'full' && msg.target === this.myId) {
+      toast('ルームが満員です（最大4人）');
+      this.destroy();
+      showScreen('#home-screen');
+      return;
+    }
+
+    if (this.onMessage) this.onMessage(msg, fromId);
   },
 
   async _enterRoom(code, name, asHost) {
-    this.setStatus('通信準備中…', true);
-    const { joinRoom, selfId } = await this._loadStrategy();
-
-    // clean previous session without wiping callbacks
-    if (this._leave) { try { this._leave(); } catch {} }
-    this.room = null;
-    this._sendRaw = null;
-    this._leave = null;
-
+    this.destroyRoomOnly();
     this.solo = false;
     this.isHost = asHost;
     this.myName = name;
     this.hostId = code;
-    this.myId = selfId;
-    this._selfId = selfId;
+    this.myId = 'P' + Math.random().toString(36).slice(2, 9).toUpperCase();
     this.players.clear();
-    this.players.set(selfId, this.me());
+    this._seen.clear();
+    this.players.set(this.myId, this.me());
+    this._seen.set(this.myId, Date.now());
     this._emitPlayers();
 
     this.setStatus('ルーム接続中…', true);
-    const room = joinRoom({ appId: 'minbato-rhythm-party-v1' }, 'MB-' + code);
-    this.room = room;
+    const client = await this._connectMqtt();
+    this.client = client;
+    this.topic = 'minbato/v1/' + code;
 
-    const [sendMsg, getMsg] = room.makeAction('msg');
-    this._sendRaw = sendMsg;
-    this._leave = () => { try { room.leave(); } catch {} };
-
-    getMsg((msg, fromId) => {
-      if (!msg || typeof msg !== 'object') return;
-      this._onPeerMsg(msg, fromId);
+    await new Promise((resolve, reject) => {
+      client.subscribe(this.topic, { qos: 0 }, (err) => err ? reject(err) : resolve());
     });
 
-    room.onPeerJoin((peerId) => {
-      if (!this.players.has(peerId)) {
-        this.players.set(peerId, { id: peerId, name: 'プレイヤー', score: 0, isHost: false });
-      }
+    client.on('message', (_topic, payload) => this._onMessage(payload));
+    client.on('close', () => this.setStatus('再接続中…', false));
+    client.on('connect', () => {
+      this.setStatus(`オンライン（${this.players.size}人）`, true);
       this._announce();
-      this._emitPlayers();
-      this.setStatus(`オンライン（${this.players.size}人）`, true);
     });
+    client.on('reconnect', () => this.setStatus('再接続中…', false));
 
-    room.onPeerLeave((peerId) => {
-      this.players.delete(peerId);
-      this._emitPlayers();
-      this.setStatus(`オンライン（${this.players.size}人）`, true);
-    });
+    // presence: announce + heartbeat
+    this._announce({ join: true });
+    this._heartbeat = setInterval(() => {
+      this._announce({ ping: true });
+      this._prunePlayers();
+    }, 3000);
 
-    // wait briefly for peers to appear (P2P handshake)
-    await wait(800);
-    this._announce();
     if (!asHost) {
-      const deadline = performance.now() + 15000;
-      while (performance.now() < deadline) {
-        const others = [...this.players.keys()].filter(id => id !== this.myId);
-        let peerCount = 0;
-        try { peerCount = room.getPeers ? Object.keys(room.getPeers()).length : 0; } catch {}
-        if (others.length > 0 || peerCount > 0) break;
-        await wait(500);
-        this._announce();
+      // wait until we see the host (or anyone)
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline) {
+        if (this.players.size >= 2) break;
+        await wait(400);
+        this._announce({ join: true });
       }
-      const others = [...this.players.keys()].filter(id => id !== this.myId);
-      let peerCount = 0;
-      try { peerCount = room.getPeers ? Object.keys(room.getPeers()).length : 0; } catch {}
-      if (others.length === 0 && peerCount === 0) {
+      if (this.players.size < 2) {
         this.destroy();
         throw new Error('ルームに誰もいません。ホストが先に部屋を作って待っていてね');
       }
-    }
-
-    if (this.players.size > 4) {
-      this.destroy();
-      throw new Error('ルームが満員です（最大4人）');
+      // capacity check
+      if (this.players.size > 4) {
+        this._publish({ type: 'full', target: this.myId });
+        this.destroy();
+        throw new Error('ルームが満員です（最大4人）');
+      }
+    } else {
+      // host: brief settle
+      await wait(300);
+      this._announce({ join: true });
     }
 
     this.setStatus(`オンライン（${this.players.size}人）`, true);
@@ -578,41 +672,18 @@ const Net = {
     return code;
   },
 
-  _announce() {
-    if (!this._sendRaw) return;
-    const p = this.players.get(this.myId);
-    this._sendRaw({
-      type: 'hello',
-      name: this.myName,
-      isHost: this.isHost,
-      score: p ? p.score : 0
-    });
-  },
-
-  _onPeerMsg(msg, fromId) {
-    if (msg.type === 'hello') {
-      const prev = this.players.get(fromId);
-      this.players.set(fromId, {
-        id: fromId,
-        name: msg.name || 'プレイヤー',
-        score: typeof msg.score === 'number' ? msg.score : (prev?.score || 0),
-        isHost: !!msg.isHost
-      });
-      this._emitPlayers();
-      this.setStatus(`オンライン（${this.players.size}人）`, true);
-    } else if (msg.type === 'score') {
-      const p = this.players.get(fromId) || { id: fromId, name: 'プレイヤー', isHost: false };
-      p.score = msg.score;
-      this.players.set(fromId, p);
-      this._emitPlayers();
-    } else if (msg.type === 'players' && Array.isArray(msg.list)) {
-      msg.list.forEach(p => {
-        if (p && p.id) this.players.set(p.id, p);
-      });
-      this._emitPlayers();
-    } else if (this.onMessage) {
-      this.onMessage(msg, fromId);
+  destroyRoomOnly() {
+    if (this._heartbeat) { clearInterval(this._heartbeat); this._heartbeat = null; }
+    if (this.client) {
+      try {
+        if (this.topic && this.client.connected) {
+          this.client.publish(this.topic, JSON.stringify({ type: 'bye', from: this.myId, t: Date.now() }));
+        }
+        this.client.end(true);
+      } catch {}
+      this.client = null;
     }
+    this.topic = null;
   },
 
   broadcast(msg) {
@@ -620,7 +691,7 @@ const Net = {
       if (this.onMessage) this.onMessage(msg, this.myId);
       return;
     }
-    if (this._sendRaw) this._sendRaw(msg);
+    this._publish(msg);
   },
 
   send(msg) {
@@ -628,15 +699,10 @@ const Net = {
       if (this.onMessage) this.onMessage(msg, this.myId);
       return;
     }
-    // mesh: everyone receives via action; also handle locally for host-originated events
-    if (this._sendRaw) this._sendRaw(msg);
-    if (this.isHost && this.onMessage) {
-      // host already knows locally for start_game etc. — caller also launches locally
-    }
+    this._publish(msg);
   },
 
   sendToHost(msg) {
-    // mesh: just broadcast; host filters if needed
     this.broadcast(msg);
   },
 
@@ -654,27 +720,23 @@ const Net = {
   },
 
   startSolo(name) {
-    if (this._leave) { try { this._leave(); } catch {} }
-    this.room = null;
-    this._sendRaw = null;
-    this._leave = null;
+    this.destroyRoomOnly();
     this.solo = true;
     this.isHost = true;
     this.myName = name;
     this.myId = 'SOLO';
     this.hostId = 'SOLO';
     this.players.clear();
+    this._seen.clear();
     this.players.set(this.myId, this.me());
     this.setStatus('ソロモード', true);
     this._emitPlayers();
   },
 
   destroy() {
-    if (this._leave) { try { this._leave(); } catch {} }
-    this._leave = null;
-    this._sendRaw = null;
-    this.room = null;
+    this.destroyRoomOnly();
     this.players.clear();
+    this._seen.clear();
   },
 
   updateMyScore(score) {
@@ -683,11 +745,10 @@ const Net = {
     else this.players.set(this.myId, { ...this.me(), score });
     this._emitPlayers();
     if (this.solo) return;
-    this.broadcast({ type: 'score', score });
+    this.broadcast({ type: 'score', score, name: this.myName, isHost: this.isHost });
   },
 
   syncPlayers() {
-    this.broadcast({ type: 'players', list: [...this.players.values()] });
     this._emitPlayers();
   }
 };
