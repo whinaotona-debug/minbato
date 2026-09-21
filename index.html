@@ -7,7 +7,6 @@
 <title>みんばと！リズムパーティ</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;600;700&family=Mochiy+Pop+One&display=swap" rel="stylesheet">
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <style>
 :root {
   --bg1: #ff6b9d;
@@ -261,7 +260,7 @@ input:focus { border-color: #e11d74; }
       <button class="btn btn-pink" id="btn-create">ルームを作る</button>
       <button class="btn btn-blue" id="btn-join-show">ルームに参加</button>
       <button class="btn btn-purple" id="btn-solo">ひとりで練習</button>
-      <p class="hint">スマホのブラウザでタップ＆スワイプ。ルームIDを共有して2〜4人で対戦しよう！</p>
+      <p class="hint">スマホのブラウザでタップ＆スワイプ。ホストが先に部屋を作り、表示されたルームIDを共有して2〜4人で対戦しよう！</p>
     </div>
     <div class="card" id="join-panel" style="display:none">
       <h2>ルームIDを入力</h2>
@@ -341,6 +340,7 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const rand = (a, b) => a + Math.random() * (b - a);
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const uid = () => Math.random().toString(36).slice(2, 8).toUpperCase();
+const wait = (ms) => new Promise(r => setTimeout(r, ms));
 
 function toast(msg, ms = 2200) {
   const t = $('#toast');
@@ -452,59 +452,175 @@ class RhythmEngine {
   }
 }
 
-/* ========== Net (PeerJS host/client) ========== */
+/* ========== Net (Trystero P2P rooms) ========== */
 const Net = {
-  peer: null,
-  hostId: null,
+  room: null,
+  hostId: null, // room code
   isHost: false,
   solo: false,
-  conns: new Map(), // peerId -> DataConnection
-  players: new Map(), // id -> {id,name,score,ready}
+  players: new Map(),
   myId: null,
   myName: 'Player',
   onPlayers: null,
   onMessage: null,
   onStatus: null,
+  _sendRaw: null,
+  _leave: null,
+  _selfId: null,
 
   setStatus(text, ok = true) {
     if (this.onStatus) this.onStatus(text, ok);
   },
 
-  async initPeer(preferredId) {
-    return new Promise((resolve, reject) => {
-      const opts = { debug: 0 };
-      const peer = preferredId ? new Peer(preferredId, opts) : new Peer(opts);
-      const fail = (e) => { peer.destroy(); reject(e); };
-      peer.on('error', (err) => {
-        if (err.type === 'unavailable-id') fail(new Error('そのルームIDは使用中です。別のIDで再試行してください。'));
-        else if (err.type === 'peer-unavailable') fail(new Error('ルームが見つかりません'));
-        else fail(err);
-      });
-      peer.on('open', (id) => {
-        this.peer = peer;
-        this.myId = id;
-        resolve(id);
-      });
-      setTimeout(() => fail(new Error('接続タイムアウト。ネット接続を確認してください。')), 15000);
+  me() {
+    return { id: this.myId, name: this.myName, score: this.players.get(this.myId)?.score || 0, isHost: this.isHost };
+  },
+
+  _emitPlayers() {
+    if (this.onPlayers) this.onPlayers([...this.players.values()]);
+  },
+
+  async _loadStrategy() {
+    const urls = [
+      'https://esm.sh/trystero@0.21.8/mqtt',
+      'https://esm.sh/trystero@0.21.8/torrent'
+    ];
+    let lastErr;
+    for (const url of urls) {
+      try {
+        const mod = await import(url);
+        if (!mod.joinRoom || !mod.selfId) throw new Error('invalid module');
+        return mod;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error('通信ライブラリの読み込みに失敗しました');
+  },
+
+  async _enterRoom(code, name, asHost) {
+    this.setStatus('通信準備中…', true);
+    const { joinRoom, selfId } = await this._loadStrategy();
+
+    // clean previous session without wiping callbacks
+    if (this._leave) { try { this._leave(); } catch {} }
+    this.room = null;
+    this._sendRaw = null;
+    this._leave = null;
+
+    this.solo = false;
+    this.isHost = asHost;
+    this.myName = name;
+    this.hostId = code;
+    this.myId = selfId;
+    this._selfId = selfId;
+    this.players.clear();
+    this.players.set(selfId, this.me());
+    this._emitPlayers();
+
+    this.setStatus('ルーム接続中…', true);
+    const room = joinRoom({ appId: 'minbato-rhythm-party-v1' }, 'MB-' + code);
+    this.room = room;
+
+    const [sendMsg, getMsg] = room.makeAction('msg');
+    this._sendRaw = sendMsg;
+    this._leave = () => { try { room.leave(); } catch {} };
+
+    getMsg((msg, fromId) => {
+      if (!msg || typeof msg !== 'object') return;
+      this._onPeerMsg(msg, fromId);
+    });
+
+    room.onPeerJoin((peerId) => {
+      if (!this.players.has(peerId)) {
+        this.players.set(peerId, { id: peerId, name: 'プレイヤー', score: 0, isHost: false });
+      }
+      this._announce();
+      this._emitPlayers();
+      this.setStatus(`オンライン（${this.players.size}人）`, true);
+    });
+
+    room.onPeerLeave((peerId) => {
+      this.players.delete(peerId);
+      this._emitPlayers();
+      this.setStatus(`オンライン（${this.players.size}人）`, true);
+    });
+
+    // wait briefly for peers to appear (P2P handshake)
+    await wait(800);
+    this._announce();
+    if (!asHost) {
+      const deadline = performance.now() + 15000;
+      while (performance.now() < deadline) {
+        const others = [...this.players.keys()].filter(id => id !== this.myId);
+        let peerCount = 0;
+        try { peerCount = room.getPeers ? Object.keys(room.getPeers()).length : 0; } catch {}
+        if (others.length > 0 || peerCount > 0) break;
+        await wait(500);
+        this._announce();
+      }
+      const others = [...this.players.keys()].filter(id => id !== this.myId);
+      let peerCount = 0;
+      try { peerCount = room.getPeers ? Object.keys(room.getPeers()).length : 0; } catch {}
+      if (others.length === 0 && peerCount === 0) {
+        this.destroy();
+        throw new Error('ルームに誰もいません。ホストが先に部屋を作って待っていてね');
+      }
+    }
+
+    if (this.players.size > 4) {
+      this.destroy();
+      throw new Error('ルームが満員です（最大4人）');
+    }
+
+    this.setStatus(`オンライン（${this.players.size}人）`, true);
+    this._emitPlayers();
+    return code;
+  },
+
+  _announce() {
+    if (!this._sendRaw) return;
+    const p = this.players.get(this.myId);
+    this._sendRaw({
+      type: 'hello',
+      name: this.myName,
+      isHost: this.isHost,
+      score: p ? p.score : 0
     });
   },
 
-  me() {
-    return { id: this.myId, name: this.myName, score: 0, isHost: this.isHost };
-  },
-
-  broadcast(msg, exceptId = null) {
-    const data = JSON.stringify(msg);
-    for (const [id, c] of this.conns) {
-      if (id === exceptId) continue;
-      if (c.open) c.send(data);
+  _onPeerMsg(msg, fromId) {
+    if (msg.type === 'hello') {
+      const prev = this.players.get(fromId);
+      this.players.set(fromId, {
+        id: fromId,
+        name: msg.name || 'プレイヤー',
+        score: typeof msg.score === 'number' ? msg.score : (prev?.score || 0),
+        isHost: !!msg.isHost
+      });
+      this._emitPlayers();
+      this.setStatus(`オンライン（${this.players.size}人）`, true);
+    } else if (msg.type === 'score') {
+      const p = this.players.get(fromId) || { id: fromId, name: 'プレイヤー', isHost: false };
+      p.score = msg.score;
+      this.players.set(fromId, p);
+      this._emitPlayers();
+    } else if (msg.type === 'players' && Array.isArray(msg.list)) {
+      msg.list.forEach(p => {
+        if (p && p.id) this.players.set(p.id, p);
+      });
+      this._emitPlayers();
+    } else if (this.onMessage) {
+      this.onMessage(msg, fromId);
     }
   },
 
-  sendToHost(msg) {
-    if (this.isHost || this.solo) return;
-    const hostConn = this.conns.get(this.hostId);
-    if (hostConn && hostConn.open) hostConn.send(JSON.stringify(msg));
+  broadcast(msg) {
+    if (this.solo) {
+      if (this.onMessage) this.onMessage(msg, this.myId);
+      return;
+    }
+    if (this._sendRaw) this._sendRaw(msg);
   },
 
   send(msg) {
@@ -512,142 +628,67 @@ const Net = {
       if (this.onMessage) this.onMessage(msg, this.myId);
       return;
     }
-    if (this.isHost) {
-      this.handleHostMessage(msg, this.myId);
-      this.broadcast(msg);
-    } else {
-      this.sendToHost(msg);
+    // mesh: everyone receives via action; also handle locally for host-originated events
+    if (this._sendRaw) this._sendRaw(msg);
+    if (this.isHost && this.onMessage) {
+      // host already knows locally for start_game etc. — caller also launches locally
     }
   },
 
-  _wireConn(conn) {
-    conn.on('data', (raw) => {
-      let msg;
-      try { msg = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return; }
-      if (this.isHost) {
-        this.handleHostMessage(msg, conn.peer);
-        // Relay to others (except sender)
-        if (msg.type !== 'ping') this.broadcast(msg, conn.peer);
-      }
-      if (this.onMessage) this.onMessage(msg, conn.peer);
-    });
-    conn.on('close', () => {
-      this.conns.delete(conn.peer);
-      if (this.isHost) {
-        this.players.delete(conn.peer);
-        this.syncPlayers();
-      } else if (conn.peer === this.hostId) {
-        this.setStatus('ホスト切断', false);
-        toast('ホストとの接続が切れました');
-      }
-    });
-  },
-
-  handleHostMessage(msg, fromId) {
-    if (msg.type === 'hello') {
-      if (this.players.size >= 4 && !this.players.has(fromId)) {
-        const c = this.conns.get(fromId);
-        if (c) c.send(JSON.stringify({ type: 'full' }));
-        return;
-      }
-      this.players.set(fromId, { id: fromId, name: msg.name || 'Guest', score: 0, isHost: false });
-      this.syncPlayers();
-    } else if (msg.type === 'score') {
-      const p = this.players.get(fromId);
-      if (p) { p.score = msg.score; this.syncPlayers(); }
-    } else if (msg.type === 'name') {
-      const p = this.players.get(fromId);
-      if (p) { p.name = msg.name; this.syncPlayers(); }
-    }
-  },
-
-  syncPlayers() {
-    const list = [...this.players.values()];
-    this.broadcast({ type: 'players', list });
-    if (this.onPlayers) this.onPlayers(list);
+  sendToHost(msg) {
+    // mesh: just broadcast; host filters if needed
+    this.broadcast(msg);
   },
 
   async createRoom(name) {
-    this.solo = false;
-    this.isHost = true;
-    this.myName = name;
-    this.conns.clear();
-    this.players.clear();
     const code = uid();
-    this.setStatus('接続中…', true);
-    const id = await this.initPeer(code);
-    this.hostId = id;
-    this.players.set(id, this.me());
-    this.peer.on('connection', (conn) => {
-      this.conns.set(conn.peer, conn);
-      this._wireConn(conn);
-      conn.on('open', () => {
-        conn.send(JSON.stringify({ type: 'welcome', hostId: this.hostId }));
-        // ask hello via existing; client sends hello on open
-      });
-    });
-    this.setStatus('オンライン', true);
-    if (this.onPlayers) this.onPlayers([...this.players.values()]);
-    return id;
+    await this._enterRoom(code, name, true);
+    return code;
   },
 
   async joinRoom(code, name) {
-    this.solo = false;
-    this.isHost = false;
-    this.myName = name;
-    this.conns.clear();
-    this.players.clear();
-    this.hostId = code.trim().toUpperCase();
-    this.setStatus('接続中…', true);
-    const id = await this.initPeer();
-    await new Promise((resolve, reject) => {
-      const conn = this.peer.connect(this.hostId, { reliable: true });
-      const to = setTimeout(() => reject(new Error('ルームに接続できませんでした')), 12000);
-      conn.on('open', () => {
-        clearTimeout(to);
-        this.conns.set(this.hostId, conn);
-        this._wireConn(conn);
-        conn.send(JSON.stringify({ type: 'hello', name: this.myName }));
-        this.setStatus('オンライン', true);
-        resolve();
-      });
-      conn.on('error', (e) => { clearTimeout(to); reject(e); });
-      this.peer.on('error', (e) => {
-        if (e.type === 'peer-unavailable') { clearTimeout(to); reject(new Error('ルームが見つかりません')); }
-      });
-    });
-    return id;
+    const cleaned = code.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (cleaned.length < 4) throw new Error('ルームIDが短すぎます');
+    await this._enterRoom(cleaned, name, false);
+    return cleaned;
   },
 
   startSolo(name) {
+    if (this._leave) { try { this._leave(); } catch {} }
+    this.room = null;
+    this._sendRaw = null;
+    this._leave = null;
     this.solo = true;
     this.isHost = true;
     this.myName = name;
     this.myId = 'SOLO';
     this.hostId = 'SOLO';
-    this.conns.clear();
     this.players.clear();
     this.players.set(this.myId, this.me());
     this.setStatus('ソロモード', true);
-    if (this.onPlayers) this.onPlayers([...this.players.values()]);
+    this._emitPlayers();
   },
 
   destroy() {
-    for (const c of this.conns.values()) try { c.close(); } catch {}
-    this.conns.clear();
-    if (this.peer) { try { this.peer.destroy(); } catch {} this.peer = null; }
+    if (this._leave) { try { this._leave(); } catch {} }
+    this._leave = null;
+    this._sendRaw = null;
+    this.room = null;
     this.players.clear();
   },
 
   updateMyScore(score) {
     const p = this.players.get(this.myId);
     if (p) p.score = score;
-    if (this.solo) {
-      if (this.onPlayers) this.onPlayers([...this.players.values()]);
-      return;
-    }
-    if (this.isHost) this.syncPlayers();
-    else this.sendToHost({ type: 'score', score });
+    else this.players.set(this.myId, { ...this.me(), score });
+    this._emitPlayers();
+    if (this.solo) return;
+    this.broadcast({ type: 'score', score });
+  },
+
+  syncPlayers() {
+    this.broadcast({ type: 'players', list: [...this.players.values()] });
+    this._emitPlayers();
   }
 };
 
@@ -896,7 +937,6 @@ const Game = {
   }
 };
 
-function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -1728,8 +1768,8 @@ const UI = {
     el.innerHTML = '';
     list.forEach(p => {
       const chip = document.createElement('div');
-      chip.className = 'player-chip' + (p.isHost || p.id === Net.hostId ? ' host' : '');
-      chip.innerHTML = `<span class="dot"></span>${escapeHtml(p.name)}${p.id === Net.myId ? ' (あなた)' : ''}${p.isHost || p.id === Net.hostId ? ' ★' : ''}`;
+      chip.className = 'player-chip' + (p.isHost ? ' host' : '');
+      chip.innerHTML = `<span class="dot"></span>${escapeHtml(p.name)}${p.id === Net.myId ? ' (あなた)' : ''}${p.isHost ? ' ★' : ''}`;
       el.appendChild(chip);
     });
   },
